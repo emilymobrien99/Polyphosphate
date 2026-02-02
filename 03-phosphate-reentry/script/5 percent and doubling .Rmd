@@ -122,6 +122,10 @@ for (well in well_columns) {
     idx_baseline <- which.min(abs(time_fine - time_baseline))
     od_baseline <- od_smooth[idx_baseline]
     
+    # Print the baseline OD values for this well
+cat("Well", well, "- od_baseline:", round(od_baseline, 4), 
+    "| After background subtraction:", round(od_baseline_corrected, 4), "\n")
+    
     # Subtract background from baseline OD
     od_baseline_corrected <- od_baseline - background
     
