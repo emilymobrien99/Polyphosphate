@@ -1,0 +1,311 @@
+---
+title: "20260106 545 vs PPX1"
+author: "Emily"
+date: "2026-01-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#install.packages("gridExtra")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+
+# Load your data
+# Expected format: CSV with 'Time' column and well columns (e.g., 'A1', 'A2', etc.)
+# Adjust the filepath to your data file
+df <- read.csv("./PPX1_PPN1.csv", stringsAsFactors = FALSE)
+
+# Function to convert H:MM:SS or HH:MM:SS to decimal hours
+convert_time_to_hours <- function(time_str) {
+  parts <- strsplit(time_str, ":")[[1]]
+  hours <- as.numeric(parts[1])
+  minutes <- as.numeric(parts[2])
+  seconds <- as.numeric(parts[3])
+  return(hours + minutes/60 + seconds/3600)
+}
+
+# Convert Time column from H:MM:SS format to decimal hours
+df$Time <- sapply(df$Time, convert_time_to_hours)
+time <- df$Time
+
+# Get well column names (all columns except 'Time')
+all_wells <- setdiff(names(df), 'Time')
+
+# Filter to only wells B-G, columns 2-5 and 7-10
+rows_to_include <- c('B', 'C', 'D', 'E', 'F', 'G', 'H')
+cols_to_include <- c(2, 3, 4, 5, 7, 8, 9, 10)
+
+well_columns <- c()
+for (row in rows_to_include) {
+  for (col in cols_to_include) {
+    well_name <- paste0(row, col)
+    if (well_name %in% all_wells) {
+      well_columns <- c(well_columns, well_name)
+    }
+  }
+}
+
+cat("Analyzing", length(well_columns), "wells:", paste(well_columns, collapse = ", "), "\n")
+
+# Convert all well columns to numeric
+for (col in well_columns) {
+  df[[col]] <- as.numeric(as.character(df[[col]]))
+}
+
+cat("Time range:", min(time), "to", max(time), "hours\n")
+
+# Initialize results dataframe
+results <- data.frame(
+  Well = character(),
+  Max_Growth = numeric(),
+  Time_to_10pct = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# List to store plots
+plot_list <- list()
+```
+
+```{r}
+# Analyze each well
+for (well in well_columns) {
+  od_data <- df[[well]]
+  
+  tryCatch({
+    # Check if there's actual growth in this well
+    growth_range <- max(od_data, na.rm = TRUE) - min(od_data, na.rm = TRUE)
+    
+    if (growth_range < 0.01) {
+      stop(paste("Insufficient growth detected (range =", round(growth_range, 4), ")"))
+    }
+    
+    # Use LOESS smoothing to create a smooth version of the data
+    # span controls how smooth (0.1 = less smooth, follows data closely; 0.5 = more smooth)
+    loess_fit <- loess(od_data ~ time, span = 0.3)
+    
+    # Generate smoothed curve
+    time_fine <- seq(min(time), max(time), length.out = 500)
+    od_smooth <- predict(loess_fit, newdata = time_fine)
+    
+    # Find maximum growth from smoothed curve
+    K <- max(od_smooth, na.rm = TRUE)
+    
+    # Find the initial OD
+    od_init <- od_smooth[1]
+    # Set variable for OD of a media only measurement
+    background <- 0.111
+    
+    # Calculate 10% of max growth
+    #threshold <- 0.1 * K
+    threshold <- (K-od_init)*0.05 + od_init
+    #threshold <- (od_init-background)*2 + background
+    
+    # Find time point where growth reaches 10%
+    idx_10pct <- which(od_smooth >= threshold)[1]
+    if (!is.na(idx_10pct)) {
+      time_10pct <- time_fine[idx_10pct]
+    } else {
+      time_10pct <- NA
+    }
+    
+    # Store results
+    results <- rbind(results, data.frame(
+      Well = well,
+      Max_Growth = K,
+      Time_to_10pct = time_10pct
+    ))
+    
+    # Create plot data
+    plot_data <- data.frame(Time = time, OD = od_data)
+    smooth_data <- data.frame(Time = time_fine, OD = od_smooth)
+
+    # Create plot
+    p <- ggplot() +
+      geom_point(data = plot_data, aes(x = Time, y = OD), alpha = 0.7, size = 2) +
+      geom_line(data = smooth_data, aes(x = Time, y = OD), color = 'red', size = 0.7) +
+      labs(title = paste0(well, '\nMax: ', round(K, 3), ', t(10%): ', round(time_10pct, 2), 'h'),
+           x = 'Time (hours)', y = 'OD') +
+      theme_bw()
+    
+    # Add 10% threshold lines if applicable
+    if (!is.na(time_10pct)) {
+      p <- p + 
+        geom_hline(yintercept = threshold, linetype = 'dashed', color = 'green', alpha = 0.7) +
+        geom_vline(xintercept = time_10pct, linetype = 'dashed', color = 'green', alpha = 0.7)# +
+        #geom_point(aes(x = time_10pct, y = threshold), color = 'green', size = 3)
+    }
+    
+    plot_list[[well]] <- p
+    
+  }, error = function(e) {
+    message(paste("Could not analyze well", well, ":", e$message))
+    results <<- rbind(results, data.frame(
+      Well = well,
+      Max_Growth = NA,
+      Time_to_10pct = NA
+    ))
+  })
+}
+
+# Arrange plots in grid
+n_plots <- length(plot_list)
+n_cols <- 4
+n_rows <- ceiling(n_plots / n_cols)
+
+# For large numbers of wells (like 96-well plates), save as PDF instead
+# PDF doesn't have the same size restrictions as PNG
+pdf('growth_curves_5percent_fitted.pdf', width = 16, height = 4 * n_rows)
+do.call(grid.arrange, c(plot_list, ncol = n_cols))
+dev.off()
+
+# Alternatively, save plots in batches of 16 (4x4 grid) as separate PNG files
+plots_per_page <- 16
+n_pages <- ceiling(n_plots / plots_per_page)
+
+for (page in 1:n_pages) {
+  start_idx <- (page - 1) * plots_per_page + 1
+  end_idx <- min(page * plots_per_page, n_plots)
+  page_plots <- plot_list[start_idx:end_idx]
+  
+  png(paste0('growth_curves_5percent_page_', page, '.png'), 
+      width = 16, height = 16, units = 'in', res = 300)
+  do.call(grid.arrange, c(page_plots, ncol = 4))
+  dev.off()
+}
+
+# Sort results by well name
+results <- results %>% arrange(Well)
+
+# Print results
+cat("\n", rep("=", 70), "\n", sep = "")
+cat("GROWTH CURVE 5percent ANALYSIS RESULTS\n")
+cat(rep("=", 70), "\n", sep = "")
+print(results, row.names = FALSE)
+cat(rep("=", 70), "\n", sep = "")
+
+# Save results to CSV
+write.csv(results, 'growth_analysis_results5percent.csv', row.names = FALSE)
+cat("\nResults saved to 'growth_analysis_results5percent.csv'\n")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+
+# Load the results from the growth curve analysis
+results <- read.csv('growth_analysis_results5percent.csv', stringsAsFactors = FALSE)
+
+# Extract row letter and column number from well names
+results$Row <- substr(results$Well, 1, 1)
+results$Column <- as.numeric(substr(results$Well, 2, nchar(results$Well)))
+
+# Assign species based on column number
+results$Species <- ifelse(results$Column %in% c(2, 3, 4, 5), "Species 1", "Species 2")
+
+# Assign time point based on row
+results$TimePoint <- case_when(
+  results$Row == "B" ~ 6,
+  results$Row == "C" ~ 4,
+  results$Row == "D" ~ 3,
+  results$Row == "E" ~ 2,
+  results$Row == "F" ~ 1,
+  results$Row == "G" ~ 0.5,
+  results$Row == "H" ~ 0,
+  TRUE ~ NA_real_
+)
+
+# Calculate mean for each species at each time point
+summary_stats <- results %>%
+  group_by(Species, TimePoint) %>%
+  summarise(
+    Mean_MaxGrowth = mean(Max_Growth, na.rm = TRUE),
+    Mean_Time10pct = mean(Time_to_10pct, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Create separate datasets for each species
+species1_data <- results %>% filter(Species == "Species 1")
+species2_data <- results %>% filter(Species == "Species 2")
+species1_summary <- summary_stats %>% filter(Species == "Species 1")
+species2_summary <- summary_stats %>% filter(Species == "Species 2")
+
+# Bar graphs for Maximum Growth - Species 1
+p1_species1 <- ggplot() +
+  geom_bar(data = species1_summary, aes(x = factor(TimePoint), y = Mean_MaxGrowth),
+           stat = "identity", fill = "steelblue", alpha = 0.7, width = 0.6) +
+  geom_point(data = species1_data, aes(x = factor(TimePoint), y = Max_Growth),
+             size = 3, position = position_jitter(width = 0.1, seed = 42)) +
+  labs(title = "Species 1 - Maximum Growth",
+       x = "Time Point (hours)",
+       y = "Maximum Growth (OD)") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+
+# Bar graphs for Maximum Growth - Species 2
+p1_species2 <- ggplot() +
+  geom_bar(data = species2_summary, aes(x = factor(TimePoint), y = Mean_MaxGrowth),
+           stat = "identity", fill = "coral", alpha = 0.7, width = 0.6) +
+  geom_point(data = species2_data, aes(x = factor(TimePoint), y = Max_Growth),
+             size = 3, position = position_jitter(width = 0.1, seed = 42)) +
+  labs(title = "Species 2 - Maximum Growth",
+       x = "Time Point (hours)",
+       y = "Maximum Growth (OD)") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+
+# Bar graphs for Time to 10% - Species 1
+p2_species1 <- ggplot() +
+  geom_bar(data = species1_summary, aes(x = factor(TimePoint), y = Mean_Time10pct),
+           stat = "identity", fill = "steelblue", alpha = 0.7, width = 0.6) +
+  geom_point(data = species1_data, aes(x = factor(TimePoint), y = Time_to_10pct),
+             size = 3, position = position_jitter(width = 0.1, seed = 42)) +
+  labs(title = "545 - Time to 5%",
+       x = "Time Point (hours)",
+       y = "Time to 5% (hours)") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+
+# Bar graphs for Time to 10% - Species 2
+p2_species2 <- ggplot() +
+  geom_bar(data = species2_summary, aes(x = factor(TimePoint), y = Mean_Time10pct),
+           stat = "identity", fill = "coral", alpha = 0.7, width = 0.6) +
+  geom_point(data = species2_data, aes(x = factor(TimePoint), y = Time_to_10pct),
+             size = 3, position = position_jitter(width = 0.1, seed = 42)) +
+  labs(title = "1053 - Time to 5%",
+       x = "Time Point (hours)",
+       y = "Time to 5% (hours)") +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+
+# Display plots side by side
+grid.arrange(p1_species1, p1_species2, ncol = 2)
+grid.arrange(p2_species1, p2_species2, ncol = 2)
+
+# Save combined plots
+png("max_growth_comparison.png", width = 14, height = 6, units = "in", res = 300)
+grid.arrange(p1_species1, p1_species2, ncol = 2)
+dev.off()
+
+png("time_to_5percent.png", width = 14, height = 6, units = "in", res = 300)
+grid.arrange(p2_species1, p2_species2, ncol = 2)
+dev.off()
+
+# Print summary statistics
+cat("\n=== SUMMARY STATISTICS ===\n")
+print(summary_stats)
+
+# Save summary statistics
+write.csv(summary_stats, 'species_summary_stats.csv', row.names = FALSE)
+cat("\nSummary statistics saved to 'species_summary_stats.csv'\n")
+cat("Plots saved as 'max_growth_comparison.png' and 'time_5percent_comparison.png'\n")
+```
+
